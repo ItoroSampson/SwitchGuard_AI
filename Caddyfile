@@ -1,0 +1,17 @@
+# SwitchGuard AI Reverse Proxy Configuration
+
+localhost:8443 {
+    # Forward all traffic to Uvicorn running on port 8000
+    reverse_proxy 127.0.0.1:8000
+
+    # Compression for JSON telemetry payloads
+    encode gzip zstd
+
+    # Logging setup
+    log {
+        output file ./logs/caddy_access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+    }
+}
