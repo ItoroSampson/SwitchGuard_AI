@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime, timezone
 
 import httpx
 import redis.asyncio as aioredis
@@ -17,20 +18,91 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+
 async def send_telegram_alert(message: str):
     """Dispatches message to Telegram chat if credentials are set."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ℹ Telegram credentials not set. Skipping push notification.")
-        return
+        print(" Telegram credentials not set. Skipping push notification.")
+        return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(url, json=payload)
+            res = await client.post(url, json=payload)
+            return res.status_code == 200
     except Exception as e:
         print(f" Failed to send Telegram alert: {e}")
+        return False
+
+
+async def send_webhook_alert(
+    route_id: str,
+    status: str,
+    score: float,
+    telemetry: dict,
+):
+    """Dispatches machine-readable JSON alert payload to external HTTP webhook endpoint."""
+    if not WEBHOOK_URL:
+        print(" WEBHOOK_URL not configured. Skipping webhook dispatch.")
+        return False
+
+    payload = {
+        "event_type": "ROUTE_ANOMALY_DETECTED",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "severity": status,
+        "route_details": {
+            "route_id": route_id,
+            "issuing_bank": telemetry.get("bank"),
+            "acquiring_switch": telemetry.get("pos_provider"),
+            "card_type": telemetry.get("affected_cards", [""])[0],
+        },
+        "model_evaluation": {
+            "anomaly_score": round(float(score), 4),
+            "status": status,
+            "is_flagged": True,
+        },
+        "telemetry_metrics_5m": {
+            "incident_id": telemetry.get("incident_id"),
+            "anomaly_type": telemetry.get("anomaly_type"),
+            "volume_5m": telemetry.get("volume_5m"),
+            "failure_rate": telemetry.get("failure_rate"),
+            "avg_latency_ms": telemetry.get("avg_latency_ms"),
+            "max_consecutive_strikes": telemetry.get("max_consecutive_strikes"),
+            "ghost_count": telemetry.get("ghost_count"),
+        },
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "SwitchGuardAI-Evaluator/1.0",
+    }
+    if WEBHOOK_SECRET:
+        headers["Authorization"] = f"Bearer {WEBHOOK_SECRET}"
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+            response = await client.post(WEBHOOK_URL, json=payload, headers=headers)
+            if response.status_code in (200, 201, 202):
+                print(
+                    f" Webhook alert delivered to {WEBHOOK_URL} (HTTP {response.status_code})"
+                )
+                return True
+            else:
+                print(
+                    f" Webhook delivery failed for {route_id} (HTTP {response.status_code})"
+                )
+                return False
+    except httpx.TimeoutException:
+        print(f" Webhook request timed out delivering alert for {route_id}")
+    except Exception as e:
+        print(f" Error sending webhook alert: {e}")
+
+    return False
 
 
 async def run_anomaly_detection_loop():
@@ -38,7 +110,9 @@ async def run_anomaly_detection_loop():
         host=REDIS_HOST, port=REDIS_PORT, decode_responses=True
     )
     evaluator = AnomalyEvaluator()
-    print(" Anomaly Detection Node active (6-Feature XGBoost + Telegram Agent)...")
+    print(
+        " Anomaly Detection Node active (6-Feature XGBoost + Telegram & Webhook Agents)..."
+    )
 
     try:
         while True:
@@ -180,7 +254,17 @@ async def run_anomaly_detection_loop():
                         print(
                             f"\n--- TELEGRAM ALERT DISPATCH ---\n{alert_text}\n-------------------------------\n"
                         )
-                        await send_telegram_alert(alert_text)
+
+                        await asyncio.gather(
+                            send_telegram_alert(alert_text),
+                            send_webhook_alert(
+                                route_id=route_id,
+                                status=current_status,
+                                score=score,
+                                telemetry=telemetry_payload,
+                            ),
+                            return_exceptions=True,
+                        )
 
                         await redis_client.set(alert_key, current_status, ex=900)
 
