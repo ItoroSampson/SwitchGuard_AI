@@ -1,13 +1,18 @@
-import json
 import logging
+import os
+import time
 
-import requests
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+from langfuse.decorators import langfuse_context, observe
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3.2:3b"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
 SYSTEM_PROMPT = """You are SwitchGuard AI, an expert payment routing assistant for POS merchants in Nigeria.
 Your job is to convert technical payment route error logs into extremely clear, concise, and urgent plain-English alerts for merchants on Telegram.
@@ -26,50 +31,116 @@ Rules:
 """
 
 
-def generate_telegram_alert(telemetry_payload: dict) -> str:
-    """Converts technical telemetry into a concise Telegram alert via local Mistral."""
+@observe(name="generate_telegram_alert")
+def generate_telegram_alert(telemetry: dict) -> str:
+    """
+    Generates merchant-friendly alerts via local Ollama while tracing
+    execution time, token counts, and fallbacks in Langfuse.
+    """
+    start_time = time.time()
 
-    prompt = f"System Telemetry Data:\n{json.dumps(telemetry_payload, indent=2)}\n\nGenerate the Telegram message:"
+    incident_id = telemetry.get("incident_id", "INC-UNKNOWN")
+    bank = telemetry.get("bank", "Unknown Bank")
+    pos_provider = telemetry.get("pos_provider", "Unknown Switch")
+    route_id = f"{bank} ➔ {pos_provider}"
+
+    langfuse_context.update_current_trace(
+        name=f"Alert Gen: {route_id}",
+        session_id=incident_id,
+        tags=["switchguard-ai", "alert-agent", OLLAMA_MODEL],
+        metadata={
+            "route_id": route_id,
+            "anomaly_type": telemetry.get("anomaly_type"),
+            "failure_rate": telemetry.get("failure_rate"),
+            "ghost_count": telemetry.get("ghost_count", 0),
+        },
+    )
+
+    affected_cards = ", ".join(telemetry.get("affected_cards", ["All Cards"]))
+    unaffected_cards = ", ".join(telemetry.get("unaffected_cards", ["None"]))
+
+    prompt = f"""
+[INCIDENT TELEMETRY DATA]
+Incident ID: {incident_id}
+Bank/Route: {route_id}
+Anomaly Type: {telemetry.get("anomaly_type")}
+Affected Card Types: {affected_cards}
+Safe Card Types: {unaffected_cards}
+Failure Rate: {telemetry.get("failure_rate", 0.0) * 100:.1f}%
+Ghost Debits Detected: {telemetry.get("ghost_count", 0)}
+5-Min Volume: {telemetry.get("volume_5m", 0)}
+Average Latency: {telemetry.get("avg_latency_ms", 0)} ms
+
+Generate the Telegram alert message following system rules.
+"""
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "system": SYSTEM_PROMPT,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.2, "num_predict": 180},
+    }
 
     try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": MODEL_NAME,
-                "system": SYSTEM_PROMPT,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.2, "num_predict": 180},
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        return response.json().get("response", "").strip()
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(OLLAMA_URL, json=payload)
+            response.raise_for_status()
+            res_json = response.json()
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Ollama connection error: {e}")
+            raw_response = res_json.get("response", "").strip()
+            eval_duration_sec = time.time() - start_time
 
-        cards = ", ".join(telemetry_payload.get("affected_cards", ["All Cards"]))
-        return (
-            f"🚨 **ALERT: {telemetry_payload.get('bank', 'Issuer')} Route Issue**\n\n"
-            f"💳 **Affected Cards:** {cards}\n"
-            f"⚠️ **Anomaly:** {telemetry_payload.get('anomaly_type')}\n"
+            prompt_tokens = res_json.get("prompt_eval_count", 0)
+            completion_tokens = res_json.get("eval_count", 0)
+
+            langfuse_context.update_current_observation(
+                input={"system_prompt": SYSTEM_PROMPT, "telemetry_prompt": prompt},
+                output=raw_response,
+                model=OLLAMA_MODEL,
+                usage={
+                    "input": prompt_tokens,
+                    "output": completion_tokens,
+                    "total": prompt_tokens + completion_tokens,
+                },
+                metadata={
+                    "total_duration_sec": eval_duration_sec,
+                    "ollama_eval_duration_ms": res_json.get("eval_duration", 0) / 1e6,
+                },
+            )
+
+            return raw_response
+
+    except Exception as e:
+        logger.error(f"Ollama connection or execution error: {e}")
+
+        fallback_msg = (
+            f"🚨 **ALERT: {bank} Route Issue**\n\n"
+            f"💳 **Affected Cards:** {affected_cards}\n"
+            f"⚠️ **Anomaly:** {telemetry.get('anomaly_type', 'ROUTE_DEGRADATION')}\n"
             f"💡 **Action:** Switch default terminal route to an alternative bank switch immediately to prevent ghost debit disputes."
         )
+
+        langfuse_context.update_current_observation(
+            level="ERROR", status_message=str(e), output=fallback_msg
+        )
+
+        return fallback_msg
 
 
 if __name__ == "__main__":
     sample_incident = {
         "incident_id": "INC-8821",
         "bank": "First Bank",
+        "pos_provider": "Moniepoint",
         "anomaly_type": "GHOST_DEBIT_RISK",
         "affected_cards": ["Verve", "Mastercard"],
         "unaffected_cards": ["Visa"],
         "failure_rate": 0.42,
+        "ghost_count": 3,
+        "volume_5m": 120,
         "avg_latency_ms": 8450,
-        "recommended_action": "Switch default terminal route to alternative bank channels immediately.",
     }
 
-    print("--- Generating Alert via Ollama ---")
-    alert_text = generate_telegram_alert(sample_incident)
-    print(alert_text)
+    print("--- Testing  Alert Agent ---")
+    print(generate_telegram_alert(sample_incident))
